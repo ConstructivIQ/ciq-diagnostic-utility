@@ -63,6 +63,43 @@ _SCAN_KEYWORDS = {
     "lambda": [["data", "integr"], ["di-lambda"], ["dataintegration"]],
 }
 
+# Key service keyword sets — a log group matches if its name (lowercased)
+# contains ALL keywords in at least one set.
+_KEY_SERVICE_PATTERNS: list[list[str]] = [
+    ["auth"],
+    ["data", "integr"],   # data-integration / dataintegration
+    ["date", "block"],   # date-block-engine
+    ["report", "engine"],
+    ["extract"],
+]
+
+
+# Log group name substrings that are never application logs (metrics, insights)
+_EXCLUDE_LOG_GROUP_SUBSTRINGS: list[str] = [
+    "containerinsights",  # ECS performance metrics, not app logs
+]
+
+# Non-prod environment markers to exclude when env == "prod"
+_NON_PROD_MARKERS: list[str] = [
+    "demo", "sandbox", "pilot", "-sb-", "ciq-sb-", "ciq-qa-", "ciq-dev-", "ciq-perf-",
+]
+
+
+def _matches_key_service(name: str, env: str = "prod") -> bool:
+    lower = name.lower()
+    # Skip infrastructure/metrics log groups
+    if any(excl in lower for excl in _EXCLUDE_LOG_GROUP_SUBSTRINGS):
+        return False
+    # Env-scoped: for prod, exclude groups belonging to other envs
+    if env == "prod":
+        if any(marker in lower for marker in _NON_PROD_MARKERS):
+            return False
+    elif env == "demo":
+        if "demo" not in lower:
+            return False
+    # dev / qa / perf are on us-east-2 so region already isolates them
+    return any(all(k in lower for k in kws) for kws in _KEY_SERVICE_PATTERNS)
+
 # CWI query: all error + warn lines for a project_id
 _QUERY = """fields @timestamp, @message
 | filter @message like /{project_id}/ and (@message like /level:error/ or @message like /level:warn/){extra_filter}
@@ -224,6 +261,176 @@ def _parse_row(row: dict) -> dict:
         "error_name":    error_name,
         "message":       message,
         "raw":           raw,
+    }
+
+
+def _list_all_log_groups(client) -> list[str]:
+    """Return every log group name visible to the client."""
+    groups: list[str] = []
+    try:
+        paginator = client.get_paginator("describe_log_groups")
+        for page in paginator.paginate():
+            for g in page.get("logGroups", []):
+                groups.append(g["logGroupName"])
+    except Exception:
+        pass
+    return groups
+
+
+def collect_project_key_services(
+    project_id: str,
+    env: str = "prod",
+    hours: int = 24,
+    message_filter: str | None = None,
+    max_workers: int = 8,
+    progress_cb=None,
+) -> dict:
+    """
+    Query only the key service log groups (auth, data-integration, dateblock,
+    report-engine, extraction) for project_id errors/warns.
+    Groups are discovered dynamically by keyword matching so the function works
+    across dev / qa / perf / prod without hardcoded names.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    cfg    = _LOG_GROUPS.get(env, _LOG_GROUPS["prod"])
+    region = cfg["region"]
+    client = _boto3_client(region, env=env)
+
+    all_groups   = _list_all_log_groups(client)
+    key_groups   = [g for g in all_groups if _matches_key_service(g, env=env)]
+
+    if not key_groups:
+        return {
+            "project_id": project_id, "env": env, "hours": hours,
+            "region": region, "message_filter": message_filter,
+            "log_groups_scanned": [], "errors": [], "total": 0,
+            "group_hits": {}, "group_errors": {}, "key_services_mode": True,
+        }
+
+    group_hits:   dict[str, int] = {}
+    group_errors: dict[str, str] = {}
+    all_rows:     list[dict]     = []
+
+    def _query_one(group: str) -> tuple[str, list[dict], str | None]:
+        try:
+            rows = _run_insights_query(client, group, project_id, hours, message_filter)
+            parsed = []
+            for r in rows:
+                p = _parse_row(r)
+                p["source"]    = group
+                p["log_group"] = group
+                parsed.append(p)
+            return group, parsed, None
+        except Exception as exc:
+            return group, [], str(exc)
+
+    total = len(key_groups)
+    done  = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_query_one, g): g for g in key_groups}
+        for fut in as_completed(futures):
+            group, rows, err = fut.result()
+            done += 1
+            if err:
+                group_errors[group] = err
+            else:
+                group_hits[group] = len(rows)
+                all_rows.extend(rows)
+            if progress_cb:
+                progress_cb(done, total, group)
+
+    all_rows.sort(key=lambda r: r.get("ts_raw", ""), reverse=True)
+
+    return {
+        "project_id":         project_id,
+        "env":                env,
+        "hours":              hours,
+        "region":             region,
+        "message_filter":     message_filter,
+        "log_groups_scanned": key_groups,
+        "errors":             all_rows,
+        "total":              len(all_rows),
+        "group_hits":         group_hits,
+        "group_errors":       group_errors,
+        "key_services_mode":  True,
+    }
+
+
+def collect_project_all_groups(
+    project_id: str,
+    env: str = "prod",
+    hours: int = 24,
+    message_filter: str | None = None,
+    max_workers: int = 8,
+    progress_cb=None,
+) -> dict:
+    """
+    Query EVERY log group in the region for project_id errors/warns.
+    Runs up to max_workers queries in parallel (AWS limit is ~10 concurrent).
+    progress_cb(done, total, group_name) is called after each group finishes.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    cfg    = _LOG_GROUPS.get(env, _LOG_GROUPS["prod"])
+    region = cfg["region"]
+    client = _boto3_client(region, env=env)
+
+    all_groups = _list_all_log_groups(client)
+    if not all_groups:
+        return {
+            "project_id": project_id, "env": env, "hours": hours,
+            "region": region, "message_filter": message_filter,
+            "log_groups_scanned": [], "errors": [], "total": 0,
+            "group_hits": {}, "group_errors": {}, "all_groups_mode": True,
+        }
+
+    group_hits:   dict[str, int] = {}
+    group_errors: dict[str, str] = {}
+    all_rows:     list[dict]     = []
+
+    def _query_one(group: str) -> tuple[str, list[dict], str | None]:
+        try:
+            rows = _run_insights_query(client, group, project_id, hours, message_filter)
+            parsed = []
+            for r in rows:
+                p = _parse_row(r)
+                p["source"]    = group
+                p["log_group"] = group
+                parsed.append(p)
+            return group, parsed, None
+        except Exception as exc:
+            return group, [], str(exc)
+
+    total = len(all_groups)
+    done  = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_query_one, g): g for g in all_groups}
+        for fut in as_completed(futures):
+            group, rows, err = fut.result()
+            done += 1
+            if err:
+                group_errors[group] = err
+            else:
+                group_hits[group] = len(rows)
+                all_rows.extend(rows)
+            if progress_cb:
+                progress_cb(done, total, group)
+
+    all_rows.sort(key=lambda r: r.get("ts_raw", ""), reverse=True)
+
+    return {
+        "project_id":       project_id,
+        "env":              env,
+        "hours":            hours,
+        "region":           region,
+        "message_filter":   message_filter,
+        "log_groups_scanned": all_groups,
+        "errors":           all_rows,
+        "total":            len(all_rows),
+        "group_hits":       group_hits,
+        "group_errors":     group_errors,
+        "all_groups_mode":  True,
     }
 
 

@@ -118,6 +118,12 @@ console = Console()
 @click.option("--filter", "message_filter", default=None, metavar="KEYWORD",
               help="Narrow --project-id results to log lines containing this keyword "
                    "(added as 'and @message like /KEYWORD/' in the CWI query)")
+@click.option("--key-services", "key_services", is_flag=True, default=False,
+              help="Query key service log groups (auth, data-integration, dateblock, "
+                   "report-engine, extraction) in parallel. Use with --project-id.")
+@click.option("--all-log-groups", "all_log_groups", is_flag=True, default=False,
+              help="Query ALL CloudWatch log groups in the region. "
+                   "Runs up to 8 queries in parallel. Use with --project-id.")
 @click.option("--list-log-groups", "list_log_groups", is_flag=True, default=False,
               help="List all CloudWatch log groups in the environment's region and exit")
 @click.option("--log-group-filter", "log_group_filter", default=None, metavar="TEXT",
@@ -130,7 +136,7 @@ def main(issue, jql, logs, api_base, email, email_keyword,
          since, context, output, max_logs, max_emails, demo, open_report,
          cw_group, cw_env, cw_stream, cw_region,
          env, all_envs, hours, top, severity, gen_html, gen_infra, infra_cost, gen_waste,
-         project_id, message_filter, list_log_groups, log_group_filter):
+         project_id, message_filter, key_services, all_log_groups, list_log_groups, log_group_filter):
     """ConstructivIQ Diagnostic Utility — investigate production issues."""
 
     # Smart hours default: 20 days for project queries, 24h otherwise
@@ -195,40 +201,128 @@ def main(issue, jql, logs, api_base, email, email_keyword,
     # terminal summary; also generate HTML when --html is passed.
     if project_id:
         project_env = env or "prod"
-        from collectors.project_collector import collect_project
         project_data = None
-        console.print(
-            f"\n[bold]Querying CloudWatch…[/bold] project=[cyan]{project_id}[/cyan]  "
-            f"env=[cyan]{project_env.upper()}[/cyan]  window=[cyan]{hours}h[/cyan]"
-            + (f"  filter=[cyan]{message_filter}[/cyan]" if message_filter else "")
-            + "\n[dim](ECS + Lambda log groups, polling up to 60s each — please wait)[/dim]"
-        )
-        with Progress(
-            SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-            console=console, transient=False,
-        ) as proj_progress:
-            ptask = proj_progress.add_task(
-                f"Starting CWI query for {project_id[:8]}…",
-                total=None,
+
+        if key_services:
+            # ── Key services: auth, data-integration, dateblock, report-engine, extraction
+            from collectors.project_collector import collect_project_key_services
+            console.print(
+                f"\n[bold]Querying key service log groups…[/bold] "
+                f"project=[cyan]{project_id}[/cyan]  "
+                f"env=[cyan]{project_env.upper()}[/cyan]  window=[cyan]{hours}h[/cyan]"
+                + (f"  filter=[cyan]{message_filter}[/cyan]" if message_filter else "")
+                + "\n[dim](auth / data-integration / dateblock / report-engine / extraction — 8 parallel workers)[/dim]"
             )
-            try:
-                proj_progress.update(ptask, description="Querying ECS log group…")
-                project_data = collect_project(
-                    project_id, env=project_env, hours=hours,
-                    message_filter=message_filter,
+            with Progress(
+                SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                console=console, transient=False,
+            ) as proj_progress:
+                ptask = proj_progress.add_task("Discovering key service log groups…", total=None)
+
+                def _cb_ks(done, total, group):
+                    proj_progress.update(
+                        ptask,
+                        description=f"Querying [{done}/{total}] {group}"
+                    )
+
+                try:
+                    project_data = collect_project_key_services(
+                        project_id, env=project_env, hours=hours,
+                        message_filter=message_filter,
+                        max_workers=8, progress_cb=_cb_ks,
+                    )
+                    n = project_data.get("total", 0)
+                    scanned = len(project_data.get("log_groups_scanned", []))
+                    hits = sum(1 for v in project_data.get("group_hits", {}).values() if v > 0)
+                    proj_progress.update(
+                        ptask,
+                        description=f"[green]✓ Done — {n} event(s) across {hits}/{scanned} groups"
+                    )
+                except Exception as exc:
+                    proj_progress.update(
+                        ptask,
+                        description=f"[red]✗ Failed — {exc}"
+                    )
+
+        elif all_log_groups:
+            # ── Scan EVERY log group in the region in parallel ───────────────
+            from collectors.project_collector import collect_project_all_groups
+            console.print(
+                f"\n[bold]Querying ALL CloudWatch log groups…[/bold] "
+                f"project=[cyan]{project_id}[/cyan]  "
+                f"env=[cyan]{project_env.upper()}[/cyan]  window=[cyan]{hours}h[/cyan]"
+                + (f"  filter=[cyan]{message_filter}[/cyan]" if message_filter else "")
+                + "\n[dim](8 parallel workers — this may take a few minutes)[/dim]"
+            )
+            _done_count = [0]
+            _total_groups = [1]
+            with Progress(
+                SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                console=console, transient=False,
+            ) as proj_progress:
+                ptask = proj_progress.add_task("Discovering log groups…", total=None)
+
+                def _cb(done, total, group):
+                    _done_count[0] = done
+                    _total_groups[0] = total
+                    proj_progress.update(
+                        ptask,
+                        description=f"Querying [{done}/{total}] {group}"
+                    )
+
+                try:
+                    project_data = collect_project_all_groups(
+                        project_id, env=project_env, hours=hours,
+                        message_filter=message_filter,
+                        max_workers=8, progress_cb=_cb,
+                    )
+                    n = project_data.get("total", 0)
+                    scanned = len(project_data.get("log_groups_scanned", []))
+                    hits = sum(1 for v in project_data.get("group_hits", {}).values() if v > 0)
+                    proj_progress.update(
+                        ptask,
+                        description=f"[green]✓ Done — {n} event(s) across {hits}/{scanned} groups"
+                    )
+                except Exception as exc:
+                    proj_progress.update(
+                        ptask,
+                        description=f"[red]✗ Failed — {exc}"
+                    )
+        else:
+            # ── Default: ECS + Lambda only ───────────────────────────────────
+            from collectors.project_collector import collect_project
+            console.print(
+                f"\n[bold]Querying CloudWatch…[/bold] project=[cyan]{project_id}[/cyan]  "
+                f"env=[cyan]{project_env.upper()}[/cyan]  window=[cyan]{hours}h[/cyan]"
+                + (f"  filter=[cyan]{message_filter}[/cyan]" if message_filter else "")
+                + "\n[dim](ECS + Lambda log groups, polling up to 180s each — please wait)[/dim]"
+            )
+            with Progress(
+                SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                console=console, transient=False,
+            ) as proj_progress:
+                ptask = proj_progress.add_task(
+                    f"Starting CWI query for {project_id[:8]}…",
+                    total=None,
                 )
-                n = project_data.get("total", 0)
-                unknown = project_data.get("unknown_groups", False)
-                suffix = " ⚠️ prod log groups unknown" if unknown else ""
-                proj_progress.update(
-                    ptask,
-                    description=f"[green]✓ Done — {n} event(s) found{suffix}"
-                )
-            except Exception as exc:
-                proj_progress.update(
-                    ptask,
-                    description=f"[red]✗ Fetch failed — {exc}"
-                )
+                try:
+                    proj_progress.update(ptask, description="Querying ECS log group…")
+                    project_data = collect_project(
+                        project_id, env=project_env, hours=hours,
+                        message_filter=message_filter,
+                    )
+                    n = project_data.get("total", 0)
+                    unknown = project_data.get("unknown_groups", False)
+                    suffix = " ⚠️ prod log groups unknown" if unknown else ""
+                    proj_progress.update(
+                        ptask,
+                        description=f"[green]✓ Done — {n} event(s) found{suffix}"
+                    )
+                except Exception as exc:
+                    proj_progress.update(
+                        ptask,
+                        description=f"[red]✗ Fetch failed — {exc}"
+                    )
 
         # Terminal summary table
         if project_data:
