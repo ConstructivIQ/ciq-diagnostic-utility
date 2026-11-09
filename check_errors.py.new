@@ -1,0 +1,417 @@
+"""
+check_errors.py
+───────────────
+Fetch and rank top N errors/warnings from the last X hours across
+Auth, Integration, Report Engine, and Audit Listener.
+Also extracts subscription and project context from log entries.
+
+Usage:
+  python check_errors.py --env dev
+  python check_errors.py --env qa --hours 3
+  python check_errors.py --env prod --hours 1 --top 20
+  python check_errors.py --env prod --hours 1 --severity ERROR
+"""
+import json
+import re
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+
+import boto3
+import click
+import config
+from reporters.cw_report import generate_cw_report
+
+# ── Log group map ─────────────────────────────────────────────────────────────
+LOG_GROUPS = {
+    "dev": {
+        "Auth":           "/ecs/dev-ciq-auth",
+        "Integration":    "/ecs/dev-ciq-dataintegration",
+        "Report Engine":  "/ecs/dev-ciq-reportengine",
+        "Audit Listener": "/ecs/dev-ciq-auditlistener",
+    },
+    "qa": {
+        "Auth":           "/ecs/qa-ciq-auth",
+        "Integration":    "/ecs/qa-ciq-dataintegration",
+        "Report Engine":  "/ecs/qa-ciq-reportengine",
+        "Audit Listener": "/ecs/qa-ciq-auditlistener",
+    },
+    "perf": {
+        "Auth":           "/ecs/perf-ciq-auth",
+        "Integration":    "/ecs/perf-ciq-dataintegration",
+        "Report Engine":  "/ecs/perf-ciq-reportengine",
+        "Audit Listener": "/ecs/perf-ciq-auditlistener",
+    },
+    "prod": {
+        "Auth":           "/ecs/ciq-prod-useast1-task-authentication",
+        "Integration":    "/ecs/ciq-prod-useast1-data-integration-job",
+        "Report Engine":  "/ecs/ciq-prod-useast1-task-report-engine",
+        "Audit Listener": "/ecs/ciq-prod-useast1-task-audit_event_listener",
+    },
+}
+
+ENV_CONFIG = {
+    "dev":   ("nonprod", "us-east-2"),
+    "qa":    ("nonprod", "us-east-2"),
+    "perf":  ("nonprod", "us-east-2"),
+    "prod":  ("prod",    "us-east-1"),
+}
+
+FILTER = (
+    "?ERROR ?error ?Error "
+    "?WARN ?warn ?warning ?WARNING "
+    "?CRITICAL ?critical "
+    "?EXCEPTION ?exception ?Exception "
+    "?FATAL ?fatal "
+    "?Traceback ?traceback "
+    "?stacktrace ?StackTrace"
+)
+
+SEVERITY_KEYWORDS = [
+    ("FATAL",     re.compile(r'\b(fatal|FATAL)\b')),
+    ("CRITICAL",  re.compile(r'\b(critical|CRITICAL)\b')),
+    ("ERROR",     re.compile(r'\b(error|ERROR|Error)\b')),
+    ("EXCEPTION", re.compile(r'\b(exception|EXCEPTION|Exception|Traceback|traceback|stacktrace|StackTrace)\b')),
+    ("WARN",      re.compile(r'\b(warn(?:ing)?|WARN(?:ING)?|WARNING)\b')),
+]
+
+SEVERITY_COLOR = {
+    "FATAL":     "\033[1;35m",
+    "CRITICAL":  "\033[1;31m",
+    "ERROR":     "\033[31m",
+    "EXCEPTION": "\033[35m",
+    "WARN":      "\033[33m",
+    "?":         "\033[90m",
+}
+RESET = "\033[0m"
+
+NORMALISE_RE = re.compile(
+    r"\b(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[^\s]*)\b"
+    r"|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"
+    r"|\b\d{5,}\b"
+    r"|at line \d+",
+    re.IGNORECASE,
+)
+
+# ── Field names to probe for subscription / project IDs ──────────────────────
+SUBSCRIPTION_FIELDS = [
+    "subscriptionId", "subscription_id", "subscriptionID",
+    "tenantId", "tenant_id", "tenantID",
+    "orgId", "org_id", "organizationId", "organisation_id",
+    "clientId", "client_id", "accountId", "account_id",
+    "customerId", "customer_id",
+]
+PROJECT_FIELDS = [
+    "projectId", "project_id", "projectID",
+    "workspaceId", "workspace_id",
+    "appId", "app_id", "applicationId", "application_id",
+    "reportId", "report_id",
+]
+
+# Regex to catch IDs embedded in message text
+# e.g. "subscriptionId=abc123", "for project 'myProject'", "tenant: abc-123"
+_ID_IN_TEXT_RE = re.compile(
+    r'(?:subscription|tenant|org(?:anization)?|client|customer|account)'
+    r'(?:[_\s]?[Ii][Dd])?'
+    r'[\s:=\'"]*'
+    r'([A-Za-z0-9_\-]{3,64})',
+    re.IGNORECASE,
+)
+_PROJECT_IN_TEXT_RE = re.compile(
+    r'(?:project|workspace|app(?:lication)?|report)'
+    r'(?:[_\s]?[Ii][Dd])?'
+    r'[\s:=\'"]*'
+    r'([A-Za-z0-9_\-]{3,64})',
+    re.IGNORECASE,
+)
+
+
+def _search_fields(obj: dict, fields: list[str]) -> str | None:
+    """Search top-level and one level of nesting (context, metadata, etc.)."""
+    for f in fields:
+        if f in obj and obj[f]:
+            return str(obj[f])
+    # nested: context, metadata, extra, request, user, …
+    for nested_key in ("context", "metadata", "extra", "request", "user",
+                       "ctx", "data", "payload", "properties", "attrs"):
+        sub = obj.get(nested_key)
+        if isinstance(sub, dict):
+            for f in fields:
+                if f in sub and sub[f]:
+                    return str(sub[f])
+    return None
+
+
+def extract_ids(raw: str, stream_name: str = "") -> tuple[str, str]:
+    """Return (subscription_id, project_id) — empty string if not found."""
+    sub_id = proj_id = ""
+
+    # 1. Parse JSON fields (top-level + nested)
+    try:
+        obj = json.loads(raw)
+        sub_id  = _search_fields(obj, SUBSCRIPTION_FIELDS) or ""
+        proj_id = _search_fields(obj, PROJECT_FIELDS) or ""
+        # also try message text inside JSON
+        msg_text = str(obj.get("message") or obj.get("msg") or "")
+    except (json.JSONDecodeError, AttributeError):
+        msg_text = raw
+
+    # 2. Regex scan of message text (if not found yet)
+    if not sub_id:
+        m = _ID_IN_TEXT_RE.search(msg_text)
+        if m:
+            sub_id = m.group(1)
+    if not proj_id:
+        m = _PROJECT_IN_TEXT_RE.search(msg_text)
+        if m:
+            proj_id = m.group(1)
+
+    # 3. Log stream name  (e.g. "auth/abc-subscription-id/task-xyz")
+    if stream_name and not sub_id:
+        m = _ID_IN_TEXT_RE.search(stream_name)
+        if m:
+            sub_id = m.group(1)
+
+    return sub_id[:60], proj_id[:60]
+
+
+def normalise(msg: str) -> str:
+    return NORMALISE_RE.sub("<N>", msg)[:200].strip()
+
+
+def extract_severity(raw: str) -> str:
+    try:
+        obj = json.loads(raw)
+        lvl = str(obj.get("level", "")).upper()
+        if lvl in {"FATAL", "CRITICAL", "ERROR", "WARN", "WARNING", "EXCEPTION"}:
+            return "WARN" if lvl == "WARNING" else lvl
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    for sev, pat in SEVERITY_KEYWORDS:
+        if pat.search(raw):
+            return sev
+    return "?"
+
+
+def extract_message(raw: str) -> str:
+    try:
+        obj = json.loads(raw)
+        return obj.get("message") or obj.get("msg") or raw
+    except (json.JSONDecodeError, AttributeError):
+        return raw
+
+
+def make_client(env: str):
+    account, region = ENV_CONFIG[env]
+    if account == "prod":
+        key_id = config.AWS_ACCESS_KEY_ID_PROD
+        secret = config.AWS_SECRET_ACCESS_KEY_PROD
+    else:
+        key_id = config.AWS_ACCESS_KEY_ID_NONPROD
+        secret = config.AWS_SECRET_ACCESS_KEY_NONPROD
+    return boto3.client(
+        "logs", region_name=region,
+        aws_access_key_id=key_id, aws_secret_access_key=secret,
+    )
+
+
+def fetch_events(cw, log_group: str, start_ms: int, end_ms: int) -> list[dict]:
+    events, kwargs = [], {
+        "logGroupName": log_group,
+        "startTime": start_ms,
+        "endTime": end_ms,
+        "filterPattern": FILTER,
+        "limit": 500,
+        "interleaved": True,
+    }
+    while True:
+        resp = cw.filter_log_events(**kwargs)
+        events.extend(resp.get("events", []))
+        token = resp.get("nextToken")
+        if not token or len(events) >= 2000:
+            break
+        kwargs["nextToken"] = token
+    return events
+
+
+def sev_badge(sev: str, width: int = 9) -> str:
+    color = SEVERITY_COLOR.get(sev, RESET)
+    return f"{color}{sev:<{width}}{RESET}"
+
+
+@click.command()
+@click.option("--env", "-e",
+              type=click.Choice(["dev", "qa", "perf", "prod"], case_sensitive=False),
+              default=None, help="Environment to query (omit to query all)")
+@click.option("--hours", "-h", default=1, show_default=True,
+              help="Look back this many hours")
+@click.option("--top", "-n", default=10, show_default=True,
+              help="Number of top errors to show")
+@click.option("--severity", "-s",
+              type=click.Choice(["ALL", "ERROR", "WARN", "CRITICAL", "FATAL", "EXCEPTION"],
+                                case_sensitive=False),
+              default="ALL", show_default=True,
+              help="Filter output to a specific severity level")
+@click.option("--html", "gen_html", is_flag=True, default=False,
+              help="Generate a tabbed HTML report (Customer Issues + Environment Issues)")
+@click.option("--all-envs", "all_envs", is_flag=True, default=False,
+              help="Query all environments (dev, qa, perf, prod) for HTML report")
+def main(env, hours, top, severity, gen_html, all_envs):
+    """Rank top errors/warnings and show affected subscriptions & projects."""
+    # Determine which envs to query
+    if all_envs or (gen_html and env is None):
+        envs_to_query = list(LOG_GROUPS.keys())
+    elif env is None:
+        envs_to_query = ["dev"]
+    else:
+        envs_to_query = [env]
+
+    env_results = {}
+
+    for current_env in envs_to_query:
+        cw = make_client(current_env)
+        services = LOG_GROUPS[current_env]
+        _, region = ENV_CONFIG[current_env]
+
+        now = datetime.now(tz=timezone.utc)
+        end_ms = int(now.timestamp() * 1000)
+        start_ms = int((now - timedelta(hours=hours)).timestamp() * 1000)
+
+        print(f"\nQuerying {current_env.upper()} ({region}) — last {hours}h")
+        if severity != "ALL":
+            print(f"Filtering to severity: {severity}")
+        print(f"Services: {', '.join(services)}\n")
+
+        env = current_env
+
+        counts: Counter           = Counter()
+        latest: dict[str, str]   = {}
+        service_hits              = defaultdict(set)
+        raw_samples               = {}
+        severities                = {}
+        totals: dict[str, int]   = {}
+        sev_totals: Counter       = Counter()
+        # subscription / project tracking
+        sub_hits                  = defaultdict(set)
+        proj_hits                 = defaultdict(set)
+        sub_errors: Counter       = Counter()
+        proj_errors: Counter      = Counter()
+        id_found_count            = 0
+        total_events              = 0
+
+        for svc, group in services.items():
+        print(f"  [{svc}] fetching...", end=" ", flush=True)
+        try:
+            events = fetch_events(cw, group, start_ms, end_ms)
+            totals[svc] = len(events)
+            total_events += len(events)
+            print(f"{len(events)} events")
+            for ev in events:
+                raw = (ev.get("message") or "").rstrip()
+                stream = ev.get("logStreamName", "")
+                sev = extract_severity(raw)
+                sev_totals[sev] += 1
+
+                # Apply severity filter
+                if severity != "ALL":
+                    if severity == "ERROR" and sev not in ("ERROR","CRITICAL","FATAL","EXCEPTION"):
+                        continue
+                    elif severity not in ("ALL", "ERROR") and sev != severity:
+                        continue
+
+                sub_id, proj_id = extract_ids(raw, stream)
+                if sub_id or proj_id:
+                    id_found_count += 1
+
+                msg = extract_message(raw)
+                key = normalise(msg)
+                counts[key] += 1
+                service_hits[key].add(svc)
+
+                if key not in raw_samples:
+                    raw_samples[key] = msg[:300]
+                if key not in severities:
+                    severities[key] = sev
+
+                ts = datetime.fromtimestamp(
+                    ev["timestamp"] / 1000, tz=timezone.utc
+                ).strftime("%H:%M:%S UTC")
+                if key not in latest or ts > latest[key]:
+                    latest[key] = ts
+
+                if sub_id:
+                    sub_hits[key].add(sub_id)
+                    sub_errors[sub_id] += 1
+                if proj_id:
+                    proj_hits[key].add(proj_id)
+                    proj_errors[proj_id] += 1
+
+        except Exception as exc:
+            totals[svc] = -1
+            print(f"FAILED — {exc}")
+
+    if not counts:
+        print("\nNo matching log entries found in this window.")
+        return
+
+    W = 130
+    print(f"\n{'─'*W}")
+    print(f"  TOP {top} — {env.upper()} — last {hours}h  ({now.strftime('%Y-%m-%d %H:%M UTC')})")
+    print(f"{'─'*W}")
+    print(f"  {'#':<4} {'SEV':<11} {'Count':>6}  {'Last seen':>12}  {'Service(s)':<28}  Message")
+    print(f"  {'─'*4} {'─'*9} {'─'*6}  {'─'*12}  {'─'*28}  {'─'*50}")
+
+    for rank, (key, count) in enumerate(counts.most_common(top), 1):
+        svcs  = ", ".join(sorted(service_hits[key]))
+        last  = latest.get(key, "?")
+        sev   = severities.get(key, "?")
+        subs  = sorted(sub_hits.get(key, set()))
+        projs = sorted(proj_hits.get(key, set()))
+        sample = raw_samples.get(key, key).split("\n")[0][:80]
+        badge  = sev_badge(sev)
+        print(f"  {rank:<4} {badge} {count:>6}  {last:>12}  {svcs:<28}  {sample}")
+
+        if subs:
+            sub_str = ", ".join(subs[:5]) + (" …" if len(subs) > 5 else "")
+            print(f"  {'':4} {'':9} {'':6}  {'':12}  \033[90m  subscriptions : {sub_str}{RESET}")
+        if projs:
+            proj_str = ", ".join(projs[:5]) + (" …" if len(projs) > 5 else "")
+            print(f"  {'':4} {'':9} {'':6}  {'':12}  \033[90m  projects       : {proj_str}{RESET}")
+
+    print(f"{'─'*W}")
+
+    # Most impacted subscriptions
+    if sub_errors:
+        print(f"\nMost impacted subscriptions (by error count):")
+        for sub_id, cnt in sub_errors.most_common(10):
+            bar = "█" * min(cnt // max(1, max(sub_errors.values()) // 20), 20)
+            print(f"  {sub_id:<45} {cnt:>5}  {bar}")
+    else:
+        pct = int(id_found_count / total_events * 100) if total_events else 0
+        print(f"\nNo subscription IDs extracted ({id_found_count}/{total_events} events had identifiable IDs).")
+        print(f"  → Logs may use different field names. Share a sample log line and I'll tune the extractor.")
+
+    # Most impacted projects
+    if proj_errors:
+        print(f"\nMost impacted projects (by error count):")
+        for proj_id, cnt in proj_errors.most_common(10):
+            bar = "█" * min(cnt // max(1, max(proj_errors.values()) // 20), 20)
+            print(f"  {proj_id:<45} {cnt:>5}  {bar}")
+
+    # Severity breakdown
+    print(f"\nSeverity breakdown (all fetched events, pre-filter):")
+    for s in ("FATAL","CRITICAL","ERROR","EXCEPTION","WARN","?"):
+        if sev_totals[s]:
+            color = SEVERITY_COLOR.get(s, RESET)
+            bar = "█" * min(sev_totals[s] // max(1, total_events // 40), 40)
+            print(f"  {color}{s:<10}{RESET} {sev_totals[s]:>6}  {bar}")
+
+    print(f"\nEvents fetched per service:")
+    for svc, n in totals.items():
+        bar = "█" * min(n // 5, 40) if n > 0 else ""
+        status = f"{n:>5}  {bar}" if n >= 0 else "  ERR  (access denied or group missing)"
+        print(f"  {svc:<18} {status}")
+
+
+if __name__ == "__main__":
+    main()
