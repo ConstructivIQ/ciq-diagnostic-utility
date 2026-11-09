@@ -1,22 +1,19 @@
 # ConstructivIQ Diagnostic Utility
 
-A Python CLI tool that investigates production issues by pulling evidence from
-Jira, application logs, API health endpoints, and support email — then uses
-the Claude AI to synthesise a root-cause analysis and generate a structured
-HTML report.
+A Python CLI tool for investigating Data Integration issues at ConstructivIQ.
+Pulls errors and warnings from AWS CloudWatch Logs Insights across ECS (JOB)
+and Lambda log groups, then generates a structured HTML report.
 
 ---
 
-## Quick start (demo — no credentials needed)
+## Quick start
 
 ```bash
 cd ciq-diagnostic-utility
 pip install -r requirements.txt
+copy .env.example .env   # fill in AWS credentials
 python diagnose.py --demo
 ```
-
-This runs a synthetic scenario (CIQ-4891: dashboard failing after 18:00 UTC)
-and opens the HTML report in your browser.
 
 ---
 
@@ -32,71 +29,116 @@ pip install -r requirements.txt
 
 ```bash
 copy .env.example .env
-# Edit .env and fill in your values
 ```
+
+Edit `.env` and fill in:
 
 | Variable | Description |
 |---|---|
+| `AWS_ACCESS_KEY_ID_PROD` | AWS access key for prod / us-east-1 |
+| `AWS_SECRET_ACCESS_KEY_PROD` | AWS secret key for prod / us-east-1 |
+| `AWS_ACCESS_KEY_ID_NONPROD` | AWS access key for dev / qa / perf (us-east-2) |
+| `AWS_SECRET_ACCESS_KEY_NONPROD` | AWS secret key for dev / qa / perf (us-east-2) |
 | `JIRA_BASE_URL` | Your Atlassian domain, e.g. `https://constructiviq.atlassian.net` |
 | `JIRA_EMAIL` | Your Atlassian account email |
 | `JIRA_API_TOKEN` | Create at https://id.atlassian.com/manage-profile/security/api-tokens |
-| `ANTHROPIC_API_KEY` | Enables AI root-cause analysis — tool degrades to heuristic without it |
-| `EMAIL_HOST` / `EMAIL_USER` / `EMAIL_PASSWORD` | IMAP credentials for support inbox |
-| `LOG_PATHS` | Comma-separated log file paths or glob patterns |
-| `API_BASE_URL` | Base URL of the ConstructivIQ API to health-check |
+| `ANTHROPIC_API_KEY` | Enables AI root-cause analysis (optional) |
+
+> **Never commit `.env` to git.** It is listed in `.gitignore`.
 
 ---
 
 ## Usage
 
-### Investigate a single Jira issue
+### Look up errors for a specific project
+
+```bash
+python diagnose.py --project-id <uuid> --html
+```
+
+Queries both ECS and Lambda CloudWatch log groups for all `level:error` and
+`level:warn` lines in the last 20 days (480 h), then opens an HTML report.
+
+```bash
+# Narrow the window
+python diagnose.py --project-id <uuid> --hours 72 --html
+
+# Add a keyword filter
+python diagnose.py --project-id <uuid> --filter "timeout" --html
+```
+
+### Investigate by environment
+
+```bash
+# Prod (default)
+python diagnose.py --env prod --html
+
+# Non-prod
+python diagnose.py --env qa --html
+python diagnose.py --env dev --hours 48 --html
+```
+
+### Investigate a Jira issue
 
 ```bash
 python diagnose.py --issue CIQ-1234
 ```
 
-### Include local log files
-
-```bash
-python diagnose.py --issue CIQ-1234 --logs "C:\logs\constructiviq\*.log"
-```
-
-### Full investigation
-
-```bash
-python diagnose.py ^
-  --issue CIQ-1234 ^
-  --logs "C:\logs\constructiviq\*.log" ^
-  --api-base https://api.constructiviq.com ^
-  --email --email-keyword "login error" ^
-  --since 2026-08-20 ^
-  --output report.html
-```
-
-### JQL query (pull a set of related issues)
+### JQL query
 
 ```bash
 python diagnose.py --jql "project=CIQ AND labels=prod-incident AND created >= -7d"
 ```
 
-### All CLI options
+### List CloudWatch log groups
+
+```bash
+python diagnose.py --list-log-groups --env prod
+```
+
+### Demo mode (no credentials needed)
+
+```bash
+python diagnose.py --demo
+```
+
+---
+
+## All CLI options
 
 ```
+  --project-id UUID     Query errors for a specific project UUID
+  --env ENV             Environment: prod (default), qa, dev, perf, demo
+  --hours INT           Look-back window in hours (default: 480 when --project-id set, else 24)
+  --filter TEXT         Extra keyword filter applied to CWI query
+  --html / --no-html    Generate HTML report (default: off)
+  --open / --no-open    Auto-open report in browser after generation
+
   -i, --issue KEY       Jira issue key (e.g. CIQ-1234)
   --jql JQL             JQL query for related Jira issues
-  -l, --logs GLOB       Log file path or glob -- repeatable
-  --api-base URL        API base URL to probe
-  --email / --no-email  Include support emails
-  --email-keyword TEXT  Subject filter for emails
-  --since YYYY-MM-DD    Only include data after this date
-  -c, --context TEXT    Extra freeform context for the AI
-  -o, --output FILE     Output HTML report path
-  --max-logs INT        Max log entries (default: 200)
-  --max-emails INT      Max emails (default: 20)
+  --all-envs            Scan all environments
+  --infra               Include infrastructure checks
+  --waste               Include waste analysis
+  --list-log-groups     List CloudWatch log groups for the environment
+  --log-group-filter TEXT  Keyword filter for --list-log-groups
   --demo                Run with synthetic demo data
-  --open / --no-open    Auto-open report in browser
   -h, --help            Show help
 ```
+
+---
+
+## Environments and log groups
+
+| Env | Region | ECS log group | Lambda log group |
+|---|---|---|---|
+| `dev` | us-east-2 | `/ecs/dev-ciq-dataintegration` | `/aws/lambda/ciq-dev-ciq-dataintegration` |
+| `qa` | us-east-2 | `/ecs/qa-ciq-dataintegration` | `/aws/lambda/ciq-qa-ciq-dataintegration` |
+| `perf` | us-east-2 | `/ecs/perf-ciq-dataintegration` | `/aws/lambda/ciq-perf-ciq-dataintegration` |
+| `demo` | us-east-1 | `/ecs/ciq-demo2-useast1-data-integration-job` | `/aws/lambda/ciq-demo2-useast1-lambda-data-integration` |
+| `prod` | us-east-1 | `/ecs/ciq-prod-useast1-data-integration-job` | `/aws/lambda/ciq-prod-useast1-lambda-data-integration` |
+
+> Prod ECS group is ~64 GB — queries may take 90–120 s. The tool polls up to
+> 180 s and reports a timeout error if CloudWatch doesn't complete in time.
 
 ---
 
@@ -104,28 +146,31 @@ python diagnose.py --jql "project=CIQ AND labels=prod-incident AND created >= -7
 
 ```
 ciq-diagnostic-utility/
-├── diagnose.py                  <- CLI entry point (Click)
-├── config.py                    <- Env-var config loader
+├── diagnose.py                      <- CLI entry point (Click)
+├── config.py                        <- Env-var loader (.env via python-dotenv)
 ├── requirements.txt
-├── .env.example                 <- Copy to .env and fill in
+├── .env.example                     <- Copy to .env and fill in
 ├── collectors/
-│   ├── jira_collector.py        <- Jira REST API v3
-│   ├── log_collector.py         <- Local log file scanner
-│   ├── api_collector.py         <- HTTP health probes
-│   └── email_collector.py       <- IMAP email fetcher
+│   ├── project_collector.py         <- CloudWatch Insights queries by project UUID
+│   ├── jira_collector.py            <- Jira REST API v3
+│   ├── log_collector.py             <- Local log file scanner
+│   ├── api_collector.py             <- HTTP health probes
+│   └── email_collector.py           <- IMAP email fetcher
 ├── analyzers/
-│   └── ai_analyzer.py           <- Claude API + heuristic fallback
+│   └── ai_analyzer.py               <- Claude API + heuristic fallback
 ├── reporters/
-│   └── html_reporter.py         <- Self-contained HTML report generator
+│   ├── cw_report.py                 <- CloudWatch HTML report generator
+│   ├── html_reporter.py             <- General HTML report generator
+│   └── tabs/
+│       └── project.py               <- Project errors tab renderer
 └── sample_data/
-    └── demo_data.py             <- Synthetic CIQ-4891 scenario
+    └── demo_data.py                 <- Synthetic demo scenario
 ```
 
 ---
 
 ## Extending the tool
 
-- **New data source:** Add `collectors/my_source.py`, call it from `diagnose.py`,
-  pass results to `ai_analyzer.analyze()` via `extra_context`.
-- **Customise AI prompt:** Edit `_system_prompt()` in `analyzers/ai_analyzer.py`.
-- **New report sections:** Add `_render_*()` in `reporters/html_reporter.py`.
+- **New data source:** Add `collectors/my_source.py`, call it from `diagnose.py`.
+- **New report tab:** Add a renderer in `reporters/tabs/` and wire it in `reporters/cw_report.py`.
+- **Different log groups:** Update `_LOG_GROUPS` in `collectors/project_collector.py`.
