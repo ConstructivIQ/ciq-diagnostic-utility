@@ -1,8 +1,8 @@
 # ConstructivIQ Diagnostic Utility
 
 A Python CLI tool for investigating Data Integration issues at ConstructivIQ.
-Pulls errors and warnings from AWS CloudWatch Logs Insights across ECS (JOB)
-and Lambda log groups, then generates a structured HTML report.
+Pulls errors and warnings from AWS CloudWatch Logs Insights and generates a
+structured HTML report with a service-by-service breakdown.
 
 ---
 
@@ -53,19 +53,41 @@ Edit `.env` and fill in:
 ### Look up errors for a specific project
 
 ```bash
+# Default: queries ECS + Lambda log groups for the project
 python diagnose.py --project-id <uuid> --html
-```
 
-Queries both ECS and Lambda CloudWatch log groups for all `level:error` and
-`level:warn` lines in the last 20 days (480 h), then opens an HTML report.
+# Recommended: query key services only (auth, integration, date-block-engine,
+#              report-engine, extraction) — faster and covers the most common failure points
+python diagnose.py --project-id <uuid> --key-services --html
 
-```bash
-# Narrow the window
-python diagnose.py --project-id <uuid> --hours 72 --html
+# Narrow the time window
+python diagnose.py --project-id <uuid> --key-services --hours 72 --html
 
 # Add a keyword filter
-python diagnose.py --project-id <uuid> --filter "timeout" --html
+python diagnose.py --project-id <uuid> --key-services --filter "timeout" --html
+
+# Query every log group in the region (slow — 100+ groups)
+python diagnose.py --project-id <uuid> --all-log-groups --html
 ```
+
+The HTML report's **Project Errors** tab shows:
+- KPI tiles: total events, services with hits, latest timestamp, environment
+- **Service Overview** table: one row per log group with error count
+- **Per-service collapsible cards**: click to expand full error details (timestamp, level, import log ID, error type, message)
+- Import Log IDs: all affected import_log_ids as copyable pills
+
+### Key services scanned with `--key-services`
+
+| Pattern matched | Examples |
+|---|---|
+| `auth` | authentication, authorisation services |
+| `data` + `integr` | data-integration, dataintegration |
+| `date` + `block` | date-block-engine |
+| `report` + `engine` | report-engine |
+| `extract` | extraction services |
+
+Non-prod markers (`demo`, `sandbox`, `pilot`, `ciq-sb-`, `ciq-qa-`, etc.) are
+automatically excluded when `--env prod` (the default).
 
 ### Investigate by environment
 
@@ -93,7 +115,12 @@ python diagnose.py --jql "project=CIQ AND labels=prod-incident AND created >= -7
 ### List CloudWatch log groups
 
 ```bash
+# List all groups in the environment
 python diagnose.py --list-log-groups --env prod
+
+# Filter by keyword
+python diagnose.py --list-log-groups --log-group-filter auth --env prod
+python diagnose.py --list-log-groups --log-group-filter date-block --env prod
 ```
 
 ### Demo mode (no credentials needed)
@@ -108,6 +135,9 @@ python diagnose.py --demo
 
 ```
   --project-id UUID     Query errors for a specific project UUID
+  --key-services        Query key services only: auth, integration,
+                        date-block-engine, report-engine, extraction
+  --all-log-groups      Query every log group in the region (may be slow)
   --env ENV             Environment: prod (default), qa, dev, perf, demo
   --hours INT           Look-back window in hours (default: 480 when --project-id set, else 24)
   --filter TEXT         Extra keyword filter applied to CWI query
@@ -137,8 +167,9 @@ python diagnose.py --demo
 | `demo` | us-east-1 | `/ecs/ciq-demo2-useast1-data-integration-job` | `/aws/lambda/ciq-demo2-useast1-lambda-data-integration` |
 | `prod` | us-east-1 | `/ecs/ciq-prod-useast1-data-integration-job` | `/aws/lambda/ciq-prod-useast1-lambda-data-integration` |
 
-> Prod ECS group is ~64 GB — queries may take 90–120 s. The tool polls up to
-> 180 s and reports a timeout error if CloudWatch doesn't complete in time.
+> The prod ECS group is ~64 GB — CloudWatch Insights queries can take 90–120 s.
+> The tool polls up to 180 s and surfaces a timeout error if the query doesn't
+> complete in time (rather than silently returning 0 results).
 
 ---
 
@@ -152,6 +183,8 @@ ciq-diagnostic-utility/
 ├── .env.example                     <- Copy to .env and fill in
 ├── collectors/
 │   ├── project_collector.py         <- CloudWatch Insights queries by project UUID
+│   │                                   (collect_project, collect_project_key_services,
+│   │                                    collect_project_all_groups)
 │   ├── jira_collector.py            <- Jira REST API v3
 │   ├── log_collector.py             <- Local log file scanner
 │   ├── api_collector.py             <- HTTP health probes
@@ -162,7 +195,7 @@ ciq-diagnostic-utility/
 │   ├── cw_report.py                 <- CloudWatch HTML report generator
 │   ├── html_reporter.py             <- General HTML report generator
 │   └── tabs/
-│       └── project.py               <- Project errors tab renderer
+│       └── project.py               <- Project errors tab: service-wise view
 └── sample_data/
     └── demo_data.py                 <- Synthetic demo scenario
 ```
@@ -174,3 +207,4 @@ ciq-diagnostic-utility/
 - **New data source:** Add `collectors/my_source.py`, call it from `diagnose.py`.
 - **New report tab:** Add a renderer in `reporters/tabs/` and wire it in `reporters/cw_report.py`.
 - **Different log groups:** Update `_LOG_GROUPS` in `collectors/project_collector.py`.
+- **Add a key service:** Append a pattern list to `_KEY_SERVICE_PATTERNS` in `collectors/project_collector.py`.
