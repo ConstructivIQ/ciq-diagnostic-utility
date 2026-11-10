@@ -139,14 +139,19 @@ PROJECT_FIELDS = [
     "reportId", "report_id",
 ]
 
+# UUID pattern used by text-fallback regexes — only capture real UUIDs to
+# avoid false positives from User-Agent strings, HTTP headers, and JSON field
+# names (e.g. "AppleWebKit" matching "app", "_id" from loose word capture).
+_UUID_RE = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+
 _ID_IN_TEXT_RE = re.compile(
-    r'(?:subscription|tenant|org(?:anization)?|client|customer|account)'
-    r'(?:[_\s]?[Ii][Dd])?[\s:=\'"]*([A-Za-z0-9_\-]{3,64})',
+    r'\b(?:subscription|tenant|org(?:anization)?|client|customer|account)'
+    r'(?:[_\s]?id)?[\s:=\'"]*(' + _UUID_RE + r')',
     re.IGNORECASE,
 )
 _PROJECT_IN_TEXT_RE = re.compile(
-    r'(?:project|workspace|app(?:lication)?|report)'
-    r'(?:[_\s]?[Ii][Dd])?[\s:=\'"]*([A-Za-z0-9_\-]{3,64})',
+    r'\b(?:project|workspace|report)'
+    r'(?:[_\s]?id)?[\s:=\'"]*(' + _UUID_RE + r')',
     re.IGNORECASE,
 )
 
@@ -219,12 +224,25 @@ def _search_fields(obj: dict, fields: list) -> str:
     return ""
 
 
+_UUID_FULL_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    re.IGNORECASE,
+)
+
+def _is_uuid(val: str) -> bool:
+    return bool(val and _UUID_FULL_RE.match(val))
+
+
 def extract_ids(raw: str, stream_name: str = "") -> tuple:
     sub_id = proj_id = ""
     try:
         obj = json.loads(raw)
-        sub_id  = _search_fields(obj, SUBSCRIPTION_FIELDS)
-        proj_id = _search_fields(obj, PROJECT_FIELDS)
+        candidate = _search_fields(obj, SUBSCRIPTION_FIELDS)
+        if _is_uuid(candidate):
+            sub_id = candidate
+        candidate = _search_fields(obj, PROJECT_FIELDS)
+        if _is_uuid(candidate):
+            proj_id = candidate
         msg_text = str(obj.get("message") or obj.get("msg") or "")
     except (json.JSONDecodeError, AttributeError):
         msg_text = raw
@@ -242,7 +260,7 @@ def extract_ids(raw: str, stream_name: str = "") -> tuple:
         if m:
             sub_id = m.group(1)
 
-    return sub_id[:60], proj_id[:60]
+    return sub_id, proj_id
 
 
 def make_client(env: str):
