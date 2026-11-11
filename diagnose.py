@@ -88,6 +88,9 @@ console = Console()
               help="Narrow to a specific CloudWatch log stream (optional)")
 @click.option("--cw-region", default=None, metavar="REGION",
               help="Override AWS region (e.g. us-east-1); inferred from --cw-env by default")
+@click.option("--cw-filter", "cw_filter", default=None, metavar="PATTERN",
+              help="CloudWatch filter pattern for --cw-group (e.g. 'Payload Too Large', '413', 'ERROR'). "
+                   "Defaults to error/warn keywords when omitted.")
 @click.option("--env", "-e", default="prod",
               type=click.Choice(["dev", "qa", "perf", "prod"], case_sensitive=False),
               help="Environment shortcut: fetch errors across Auth, Integration, "
@@ -134,7 +137,7 @@ console = Console()
               help="Open the HTML report in your browser when done")
 def main(issue, jql, logs, api_base, email, email_keyword,
          since, context, output, max_logs, max_emails, demo, open_report,
-         cw_group, cw_env, cw_stream, cw_region,
+         cw_group, cw_env, cw_stream, cw_region, cw_filter,
          env, all_envs, hours, top, severity, gen_html, gen_infra, infra_cost, gen_waste,
          project_id, message_filter, key_services, all_log_groups, list_log_groups, log_group_filter):
     """ConstructivIQ Diagnostic Utility — investigate production issues."""
@@ -701,9 +704,14 @@ def main(issue, jql, logs, api_base, email, email_keyword,
                     f"Fetching CloudWatch logs [{cw_env.upper()}]...", total=None)
                 try:
                     from collectors import cloudwatch_collector
+                    # Resolve time window: --hours takes priority over --since
+                    from datetime import timedelta, timezone
+                    if hours and not since_dt:
+                        since_dt = datetime.now(tz=timezone.utc) - timedelta(hours=hours)
                     cw_entries = cloudwatch_collector.collect(
                         log_group=cw_group, env=cw_env, region=cw_region,
                         log_stream=cw_stream, since=since_dt, max_entries=max_logs,
+                        filter_pattern=cw_filter,
                     )
                     log_entries.extend(cw_entries)
                     progress.update(

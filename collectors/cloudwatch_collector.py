@@ -98,6 +98,7 @@ def collect(
     log_stream: Optional[str] = None,
     since: Optional[datetime] = None,
     max_entries: int = 200,
+    filter_pattern: Optional[str] = None,
 ) -> list[LogEntry]:
     """
     Fetch log events from a CloudWatch log group.
@@ -118,7 +119,7 @@ def collect(
         "logGroupName": log_group,
         "startTime": start_ms,
         "endTime": end_ms,
-        "filterPattern": CW_FILTER,
+        "filterPattern": filter_pattern if filter_pattern is not None else CW_FILTER,
         "limit": min(max_entries, 10_000),
         "interleaved": True,
     }
