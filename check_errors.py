@@ -479,7 +479,7 @@ def collect_env(env: str, hours: int, severity: str) -> dict:
                     cust_names[sub_id] = cname
 
     return dict(
-        counts=counts, latest=latest, service_hits=service_hits,
+        counts=counts, latest=latest, latest_ts=raw_json_ts, service_hits=service_hits,
         raw_samples=raw_samples, raw_json_samples=raw_json_samples,
         severities=severities,
         totals=totals, sev_totals=sev_totals,
