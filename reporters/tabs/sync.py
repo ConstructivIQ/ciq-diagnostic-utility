@@ -4,8 +4,8 @@ reporters/tabs/sync.py
 Integration Sync Failures tab:
   - _SYNC_CATS / categorise() — error category classifier
   - category_panel()          — summary grid of category counts
-  - sub_table()               — most-impacted subscriptions
-  - proj_table()              — most-impacted projects
+  - sub_table()               — all subscriptions
+  - proj_table()              — all projects
 """
 from __future__ import annotations
 
@@ -193,10 +193,10 @@ def sub_table(env_data: dict, show_env_col: bool = True, show_cust_col: bool = T
     mx           = max(sub_errors.values())
     sorted_subs  = sorted(
         sub_errors.items(),
-        key=lambda kv: (_SEV_RANK.get(sub_top_sev.get(kv[0], "?"), len(SEV_ORDER)), -kv[1]),
+        key=lambda kv: -sub_last_ms.get(kv[0], 0),
     )
     rows = ""
-    for i, (sid, cnt) in enumerate(sorted_subs[:25], 1):
+    for i, (sid, cnt) in enumerate(sorted_subs, 1):
         sev       = sub_top_sev.get(sid, "?")
         full_msg  = sub_top_err.get(sid, "—")
         msg       = full_msg.split("\n")[0]
@@ -276,10 +276,10 @@ def proj_table(env_data: dict) -> str:
     mx           = max(proj_errors.values())
     sorted_projs = sorted(
         proj_errors.items(),
-        key=lambda kv: (_SEV_RANK.get(proj_top_sev.get(kv[0], "?"), len(SEV_ORDER)), -kv[1]),
+        key=lambda kv: -proj_last_ms.get(kv[0], 0),
     )
     rows = ""
-    for i, (pid, cnt) in enumerate(sorted_projs[:25], 1):
+    for i, (pid, cnt) in enumerate(sorted_projs, 1):
         sev       = proj_top_sev.get(pid, "?")
         full_msg  = proj_top_err.get(pid, "—")
         msg       = full_msg.split("\n")[0]

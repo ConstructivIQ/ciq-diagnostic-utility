@@ -21,7 +21,10 @@ def render(env: str, d: dict, top: int | None = None) -> str:
     samples          = d.get("raw_samples", {})
     raw_json_samples = d.get("raw_json_samples", {})
     svc_hits         = d.get("service_hits", {})
+    proj_hits        = d.get("proj_hits", {})
+    proj_hits        = d.get("proj_hits", {})
     latest           = d.get("latest", {})
+    latest_ts        = d.get("latest_ts", {})
     sev_tot          = d.get("sev_totals", Counter())
     totals           = d.get("totals", {})
 
@@ -44,6 +47,7 @@ def render(env: str, d: dict, top: int | None = None) -> str:
         for i, (key, cnt) in enumerate(items, 1):
             sev      = sevs.get(key, "?")
             svcs     = ", ".join(sorted(svc_hits.get(key, set())))
+            projs    = ", ".join(sorted(proj_hits.get(key, set())))
             last     = latest.get(key, "—")
             full_msg = samples.get(key, key)
             msg      = full_msg.split("\n")[0]
@@ -56,6 +60,7 @@ def render(env: str, d: dict, top: int | None = None) -> str:
                 f'<td>{_bar(cnt, mx, SEV_VAR.get(sev, "var(--accent)"), "4px")}</td>'
                 f'<td class="ts">{e(last)}</td>'
                 f'<td class="sm text-m">{e(svcs)}</td>'
+                f'<td class="sm text-m">{e(projs) or "—"}</td>'
                 f'<td class="expand-cell mono sm" title="{e(full_msg)}">{e(msg)}</td>'
                 f'<td class="json-cell"><pre>{e(raw_json)}</pre></td>'
                 f"</tr>"
@@ -63,7 +68,7 @@ def render(env: str, d: dict, top: int | None = None) -> str:
         return (
             '<div class="tw"><table class="dt"><thead><tr>'
             '<th>#</th><th>Sev</th><th>Count</th><th>Volume</th>'
-            '<th>Last seen</th><th>Services</th>'
+            '<th>Last seen</th><th>Services</th><th>Project IDs</th>'
             '<th>Message ↕ click to expand</th>'
             '<th>Raw JSON ↕ click to expand</th>'
             f'</tr></thead><tbody>{rows}</tbody></table></div>'
@@ -73,7 +78,7 @@ def render(env: str, d: dict, top: int | None = None) -> str:
         mx           = counts.most_common(1)[0][1]
         sorted_items = sorted(
             ((k, counts[k]) for k in counts),
-            key=lambda kv: (_SEV_RANK.get(sevs.get(kv[0], "?"), len(SEV_ORDER)), -kv[1]),
+            key=lambda kv: -latest_ts.get(kv[0], 0),
         )
         error_items = [(k, c) for k, c in sorted_items if sevs.get(k, "?") in _ERROR_SEVS] if top is None else [(k, c) for k, c in sorted_items if sevs.get(k, "?") in _ERROR_SEVS][:top]
         errors_html = _make_table(error_items, mx, "error")

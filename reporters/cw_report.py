@@ -196,6 +196,9 @@ def _render(
       <button class="mtab" data-tab="rds" role="tab">🗄️ RDS</button>
       {'<button class="mtab proj-tab" data-tab="project" role="tab">🔍 Project Errors <span class="tab-count tab-count-err">' + str(project_data.get("total", 0) if project_data else 0) + '</span></button>' if project_id else ''}
     </nav>
+    <div class="hsearch">
+      <input type="search" id="tab-search" placeholder="🔍 Filter rows…" autocomplete="off">
+    </div>
     <div class="hmeta">
       <span class="meta-window">Last {e(str(hours))}h</span>
       <span class="dot">·</span>
@@ -240,14 +243,14 @@ def _render(
       {_sync.category_panel(sync_env_data)}
       <div class="card">
         <div class="card-hd">
-          <h2>Most Impacted Subscriptions</h2>
+          <h2>All Subscriptions</h2>
           <span class="chip">{len(all_sub):,} found</span>
         </div>
         {_sync.sub_table(sync_env_data, show_env_col=False, show_cust_col=False)}
       </div>
       <div class="card">
         <div class="card-hd">
-          <h2>Most Impacted Projects</h2>
+          <h2>All Projects</h2>
           <span class="chip">{len(all_proj):,} found</span>
         </div>
         {_sync.proj_table(sync_env_data)}
@@ -300,7 +303,26 @@ def _render(
 <div class="footer">ConstructivIQ Diagnostic Utility &middot; {e(now)}</div>
 
 <script>
-// Main tab switcher
+// ── Row filter ───────────────────────────────────────────────────────────────
+const searchInput = document.getElementById('tab-search');
+
+function applyFilter() {{
+  const q = searchInput.value.trim().toLowerCase();
+  const panel = document.querySelector('.tpanel.active');
+  if (!panel) return;
+  panel.querySelectorAll('tbody tr').forEach(row => {{
+    if (!q) {{
+      row.style.display = '';
+    }} else {{
+      const text = row.textContent.toLowerCase();
+      row.style.display = text.includes(q) ? '' : 'none';
+    }}
+  }});
+}}
+
+searchInput.addEventListener('input', applyFilter);
+
+// ── Main tab switcher ────────────────────────────────────────────────────────
 document.querySelectorAll('.mtab').forEach(b => b.addEventListener('click', () => {{
   const t = b.dataset.tab;
   document.querySelectorAll('.mtab').forEach(x => x.classList.remove('active'));
@@ -308,9 +330,12 @@ document.querySelectorAll('.mtab').forEach(b => b.addEventListener('click', () =
   b.classList.add('active');
   const panel = document.getElementById('tab-' + t);
   if (panel) panel.classList.add('active');
+  // Reset filter and re-apply (shows all on tab switch)
+  searchInput.value = '';
+  applyFilter();
 }}));
 
-// Environment sub-tabs
+// ── Environment sub-tabs ─────────────────────────────────────────────────────
 document.querySelectorAll('.etab').forEach(b => b.addEventListener('click', () => {{
   const env = b.dataset.env;
   document.querySelectorAll('.etab').forEach(x => x.classList.remove('active'));
@@ -318,15 +343,17 @@ document.querySelectorAll('.etab').forEach(b => b.addEventListener('click', () =
   b.classList.add('active');
   const p = document.getElementById('ep-' + env);
   if (p) p.classList.add('active');
+  searchInput.value = '';
+  applyFilter();
 }}));
 
-// Expand/collapse cells on click
+// ── Expand/collapse cells on click ───────────────────────────────────────────
 document.addEventListener('click', ev => {{
   const cell = ev.target.closest('.expand-cell, .json-cell');
   if (cell) cell.classList.toggle('expanded');
 }});
 
-// Auto-activate Project Errors tab if present
+// ── Auto-activate Project Errors tab if present ──────────────────────────────
 (function() {{
   const projBtn = document.querySelector('.proj-tab');
   if (projBtn) {{
