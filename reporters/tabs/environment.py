@@ -121,23 +121,18 @@ def render(env: str, d: dict, top: int | None = None) -> str:
                 f'</div>'
             )
 
+    top_label = "All" if top is None else f"Top {top}"
     return f"""
 <div class="stats-grid">{stats}</div>
-<div class="env-grid">
-  <div class="card span-main">
-    <div class="card-hd"><h3>{"All" if top is None else f"Top {top}"} Error Patterns</h3>
-      <span class="chip">{len(error_items)} unique</span></div>
-    {errors_html}
+<div class="card svc-top-card">
+  <div class="card-hd"><h3>Service Breakdown</h3>
+    <div class="sev-inline">{sev_html}</div>
   </div>
-  <div class="side-col">
-    <div class="card">
-      <div class="card-hd"><h3>Service Breakdown</h3></div>
-      <div class="svc-bars">{svc_html}</div>
-    </div>
-    <div class="card">
-      <div class="card-hd"><h3>By Severity</h3></div>
-      <div class="sev-bars">{sev_html if sev_html else '<p class="text-m sm" style="padding:12px 16px">No data</p>'}</div>
-    </div>
-  </div>
+  <div class="svc-grid">{svc_html}</div>
+</div>
+<div class="card">
+  <div class="card-hd"><h3>{top_label} Error Patterns</h3>
+    <span class="chip">{len(error_items)} unique</span></div>
+  {errors_html}
 </div>
 """
