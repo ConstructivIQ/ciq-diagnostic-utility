@@ -27,8 +27,6 @@ from reporters.tabs import sync    as _sync
 from reporters.tabs import environment as _env
 from reporters.tabs import emails  as _emails
 from reporters.tabs import rds     as _rds
-from reporters.tabs import infra   as _infra
-from reporters.tabs import waste   as _waste
 from reporters.tabs import project as _project
 
 # Shared utilities
@@ -50,8 +48,6 @@ def generate_cw_report(
     sync_data:    dict | None = None,
     emails:       list | None = None,
     rds_snap:     Any | None = None,
-    infra_data:   dict | None = None,
-    waste_data:   dict | None = None,
     project_id:   str | None = None,
     project_data: dict | None = None,
 ) -> Path:
@@ -66,10 +62,6 @@ def generate_cw_report(
                       Falls back to aggregating env_data when not provided.
         emails:       List of EmailMessage objects from email_collector.
         rds_snap:     RdsSnapshot object from rds_collector.
-        infra_data:   Dict from collectors.infra_collector.collect_infra().
-                      Set to None to skip the Infra tab (shows placeholder).
-        waste_data:   Dict from collectors.waste_collector.collect_waste().
-                      Set to None to skip the Waste Finder tab (shows placeholder).
     """
     output_path = output_path or Path(
         f"cw_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
@@ -77,7 +69,7 @@ def generate_cw_report(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
         _render(env_data, hours, jira_tickets or [], sync_data, emails or [],
-                rds_snap, infra_data, waste_data,
+                rds_snap,
                 project_id=project_id, project_data=project_data),
         encoding="utf-8",
     )
@@ -93,8 +85,6 @@ def _render(
     sync_data:    dict | None = None,
     emails:       list | None = None,
     rds_snap:     Any | None = None,
-    infra_data:   dict | None = None,
-    waste_data:   dict | None = None,
     project_id:   str | None = None,
     project_data: dict | None = None,
 ) -> str:
@@ -204,8 +194,6 @@ def _render(
         📧 Support Emails <span class="tab-count">{email_count}</span>
       </button>
       <button class="mtab" data-tab="rds" role="tab">🗄️ RDS</button>
-      <button class="mtab" data-tab="infra" role="tab">🏗️ Infra Check</button>
-      <button class="mtab" data-tab="waste" role="tab">♻️ Waste Finder</button>
       {'<button class="mtab proj-tab" data-tab="project" role="tab">🔍 Project Errors <span class="tab-count tab-count-err">' + str(project_data.get("total", 0) if project_data else 0) + '</span></button>' if project_id else ''}
     </nav>
     <div class="hmeta">
@@ -295,19 +283,6 @@ def _render(
     </div>
   </div>
 
-  <!-- Tab 6: Infra Check -->
-  <div id="tab-infra" class="tpanel">
-    <div class="container">
-      {_infra.render(infra_data)}
-    </div>
-  </div>
-
-  <!-- Tab 7: Waste Finder (unused/idle resources) -->
-  <div id="tab-waste" class="tpanel">
-    <div class="container">
-      {_waste.render(waste_data)}
-    </div>
-  </div>
 
   <!-- Tab 8: Project Errors (only rendered when --project-id supplied) -->
   {f'''<div id="tab-project" class="tpanel">

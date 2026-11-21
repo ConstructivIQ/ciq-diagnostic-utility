@@ -30,20 +30,10 @@ Usage examples:
   # Single-env HTML report
   python diagnose.py --env prod --hours 2 --html
 
-  # Full report with infrastructure inventory (free)
-  python diagnose.py --env prod --hours 1 --html --infra
-
-  # Full report with infra + cost breakdown (⚠️ $0.01 AWS charge)
-  python diagnose.py --env prod --hours 1 --html --infra --infra-cost
-
-  # Full report with unused-resource detection (free — CloudWatch standard metrics)
-  python diagnose.py --env prod --hours 1 --html --infra --waste
-
-  # Everything: infra + cost + waste finder
-  python diagnose.py --env prod --hours 1 --html --infra --infra-cost --waste
 """
 
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -108,13 +98,6 @@ console = Console()
               help="Filter to a specific severity level (ALL = show everything)")
 @click.option("--html", "gen_html", is_flag=True, default=False,
               help="Generate a self-contained HTML dashboard (Customer Issues + Environment tabs)")
-@click.option("--infra", "gen_infra", is_flag=True, default=False,
-              help="Collect AWS infrastructure inventory for prod (free — describe_*/list_* calls only)")
-@click.option("--infra-cost", "infra_cost", is_flag=True, default=False,
-              help="Include Cost Explorer data in Infra tab  ⚠️  costs $0.01 per run")
-@click.option("--waste", "gen_waste", is_flag=True, default=False,
-              help="Check CloudWatch metrics to identify unused/idle AWS resources (free — standard metrics only). "
-                   "Requires --infra to collect the resource list first.")
 @click.option("--project-id", "project_id", default=None, metavar="UUID",
               help="Project UUID to inspect — adds a dedicated Project Errors tab "
                    "showing all CloudWatch error lines for that project_id")
@@ -138,7 +121,7 @@ console = Console()
 def main(issue, jql, logs, api_base, email, email_keyword,
          since, context, output, max_logs, max_emails, demo, open_report,
          cw_group, cw_env, cw_stream, cw_region, cw_filter,
-         env, all_envs, hours, top, severity, gen_html, gen_infra, infra_cost, gen_waste,
+         env, all_envs, hours, top, severity, gen_html,
          project_id, message_filter, key_services, all_log_groups, list_log_groups, log_group_filter):
     """ConstructivIQ Diagnostic Utility — investigate production issues."""
 
@@ -369,7 +352,7 @@ def main(issue, jql, logs, api_base, email, email_keyword,
             path = generate_cw_report(
                 {}, hours=hours, output_path=out_path,
                 jira_tickets=[], sync_data=None, emails=[],
-                rds_snap=None, infra_data=None, waste_data=None,
+                rds_snap=None,
                 project_id=project_id, project_data=project_data,
             )
             console.print(f"\n[bold green]✅ HTML report:[/bold green] {path.resolve()}")
@@ -395,21 +378,29 @@ def main(issue, jql, logs, api_base, email, email_keyword,
 
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
                       console=console, transient=True) as progress:
-            for current_env in envs_to_query:
-                task = progress.add_task(
-                    f"Fetching {current_env.upper()}…", total=None)
-                try:
-                    env_results[current_env] = collect_env(current_env, hours, severity)
-                    n = env_results[current_env].get("total_events", 0)
-                    progress.update(
-                        task,
-                        description=f"[green]{current_env.upper()}: {n} events fetched"
-                    )
-                except Exception as exc:
-                    progress.update(
-                        task,
-                        description=f"[red]{current_env.upper()}: failed — {exc}"
-                    )
+            tasks = {env: progress.add_task(f"Fetching {env.upper()}…", total=None)
+                     for env in envs_to_query}
+
+            def _run_env(env):
+                return env, collect_env(env, hours, severity)
+
+            with ThreadPoolExecutor(max_workers=min(len(envs_to_query), 4)) as pool:
+                futures = {pool.submit(_run_env, env): env for env in envs_to_query}
+                for future in as_completed(futures):
+                    try:
+                        current_env, result = future.result()
+                        env_results[current_env] = result
+                        n = result.get("total_events", 0)
+                        progress.update(
+                            tasks[current_env],
+                            description=f"[green]{current_env.upper()}: {n} events fetched"
+                        )
+                    except Exception as exc:
+                        current_env = futures[future]
+                        progress.update(
+                            tasks[current_env],
+                            description=f"[red]{current_env.upper()}: failed — {exc}"
+                        )
 
         # Print terminal tables (skip if --html and querying multiple envs)
         for current_env, d in env_results.items():
@@ -426,8 +417,6 @@ def main(issue, jql, logs, api_base, email, email_keyword,
                 sync_data    = None
                 emails       = []
                 rds_snap     = None
-                infra_data   = None
-                waste_data   = None
             else:
                 # Fetch Jira Prod_Issue tickets for the Customer Tickets tab.
                 # NOTE: This is intentionally env-independent — the Customer Tickets tab
@@ -524,71 +513,6 @@ def main(issue, jql, logs, api_base, email, email_keyword,
                             description=f"[yellow]RDS fetch skipped — {exc}"
                         )
 
-            # ── Infra tab: AWS resource inventory (always prod) ───────────────
-            infra_data = None
-            if gen_infra and not project_id:
-                from collectors.infra_collector import collect_infra
-                import config as _cfg
-                _account, _region = "prod", "us-east-1"
-                with Progress(
-                    SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-                    console=console, transient=True,
-                ) as infra_progress:
-                    itask = infra_progress.add_task(
-                        f"Collecting AWS infra (prod / {_region})"
-                        + (" + cost ⚠️ $0.01" if infra_cost else " — free") + "…",
-                        total=None,
-                    )
-                    try:
-                        infra_data = collect_infra(
-                            env="prod", account=_account, region=_region,
-                            include_cost=infra_cost,
-                        )
-                        total_res = sum(
-                            len([r for r in lst if not r.get("_error")])
-                            for lst in infra_data.get("services", {}).values()
-                        )
-                        infra_progress.update(
-                            itask,
-                            description=f"[green]Infra: {total_res} resources collected"
-                        )
-                    except Exception as exc:
-                        infra_progress.update(
-                            itask,
-                            description=f"[yellow]Infra collection skipped — {exc}"
-                        )
-
-            # ── Waste Finder: CloudWatch utilisation check (free) ─────────────
-            waste_data = None
-            if gen_waste and not project_id:
-                if infra_data is None:
-                    console.print(
-                        "[yellow]⚠️  --waste requires --infra (need resource list to check). "
-                        "Add --infra to your command.[/yellow]"
-                    )
-                else:
-                    from collectors.waste_collector import collect_waste
-                    with Progress(
-                        SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-                        console=console, transient=True,
-                    ) as waste_progress:
-                        wtask = waste_progress.add_task(
-                            "Checking CloudWatch for unused/idle resources (14-day look-back)…",
-                            total=None,
-                        )
-                        try:
-                            waste_data = collect_waste(infra_data, days=14)
-                            n = waste_data.get("total", 0)
-                            waste_progress.update(
-                                wtask,
-                                description=f"[green]Waste: {n} unused/idle resource(s) found"
-                            )
-                        except Exception as exc:
-                            waste_progress.update(
-                                wtask,
-                                description=f"[yellow]Waste check skipped — {exc}"
-                            )
-
             # ── Project Errors tab: per-project CloudWatch drill-down ────────
             project_data = None
             if project_id:
@@ -624,8 +548,6 @@ def main(issue, jql, logs, api_base, email, email_keyword,
                 sync_data=sync_data,
                 emails=emails,
                 rds_snap=rds_snap,
-                infra_data=infra_data,
-                waste_data=waste_data,
                 project_id=project_id,
                 project_data=project_data,
             )
