@@ -14,7 +14,7 @@ from reporters.components import (
 )
 
 
-def render(env: str, d: dict, top: int = 15) -> str:
+def render(env: str, d: dict, top: int | None = None) -> str:
     """Render the full environment panel (stats + error table + warning table + sidebar)."""
     counts           = d.get("counts", Counter())
     sevs             = d.get("severities", {})
@@ -75,7 +75,7 @@ def render(env: str, d: dict, top: int = 15) -> str:
             ((k, counts[k]) for k in counts),
             key=lambda kv: (_SEV_RANK.get(sevs.get(kv[0], "?"), len(SEV_ORDER)), -kv[1]),
         )
-        error_items = [(k, c) for k, c in sorted_items if sevs.get(k, "?") in _ERROR_SEVS][:top]
+        error_items = [(k, c) for k, c in sorted_items if sevs.get(k, "?") in _ERROR_SEVS] if top is None else [(k, c) for k, c in sorted_items if sevs.get(k, "?") in _ERROR_SEVS][:top]
         errors_html = _make_table(error_items, mx, "error")
     else:
         errors_html = '<div class="empty-state"><p>No events found.</p></div>'
@@ -120,7 +120,7 @@ def render(env: str, d: dict, top: int = 15) -> str:
 <div class="stats-grid">{stats}</div>
 <div class="env-grid">
   <div class="card span-main">
-    <div class="card-hd"><h3>Top {top} Error Patterns</h3>
+    <div class="card-hd"><h3>{"All" if top is None else f"Top {top}"} Error Patterns</h3>
       <span class="chip">{len(error_items)} unique</span></div>
     {errors_html}
   </div>
