@@ -438,12 +438,12 @@ def print_env_table(env: str, d: dict, top: int, hours: int):
 
     W = 130
     print(f"\n{'─'*W}")
-    print(f"  TOP {top} — {env.upper()} — last {hours}h  ({now.strftime('%Y-%m-%d %H:%M UTC')})")
+    print(f"  {("TOP " + str(top)) if top is not None else "ALL ERRORS"} — {env.upper()} — last {hours}h  ({now.strftime('%Y-%m-%d %H:%M UTC')})")
     print(f"{'─'*W}")
     print(f"  {'#':<4} {'SEV':<11} {'Count':>6}  {'Last seen':>12}  {'Service(s)':<28}  Message")
     print(f"  {'─'*4} {'─'*9} {'─'*6}  {'─'*12}  {'─'*28}  {'─'*50}")
 
-    for rank, (key, count) in enumerate(counts.most_common(top), 1):
+    for rank, (key, count) in enumerate(counts.most_common(top if top is not None else None), 1):
         svcs  = ", ".join(sorted(service_hits.get(key, set())))
         last  = latest.get(key, "?")
         sev   = severities.get(key, "?")
@@ -499,8 +499,8 @@ def print_env_table(env: str, d: dict, top: int, hours: int):
               help="Environment to query (omit with --all-envs for all)")
 @click.option("--hours", "-h", default=1, show_default=True,
               help="Look back this many hours")
-@click.option("--top", "-n", default=10, show_default=True,
-              help="Number of top errors to display")
+@click.option("--top", "-n", default=None, show_default=True,
+              help="Number of top errors to display (default: all)")
 @click.option("--severity", "-s",
               type=click.Choice(["ALL", "ERROR", "WARN", "CRITICAL", "FATAL", "EXCEPTION"],
                                 case_sensitive=False),

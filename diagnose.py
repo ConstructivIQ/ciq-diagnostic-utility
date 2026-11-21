@@ -75,7 +75,7 @@ console = Console()
               help="Extra context to pass to the AI (freeform)")
 @click.option("--output", "-o", default=None, metavar="FILE",
               help="Output HTML report path (default: auto-named)")
-@click.option("--max-logs", default=200, show_default=True,
+@click.option("--max-logs", default=10000, show_default=True,
               help="Maximum log entries to include")
 @click.option("--max-emails", default=20, show_default=True,
               help="Maximum support emails to fetch")
@@ -99,8 +99,8 @@ console = Console()
               help="Query ALL environments (dev, qa, perf, prod) — best combined with --html")
 @click.option("--hours", default=None, type=int,
               help="Hours to look back (default: 480 = 20 days when --project-id is set, else 24)")
-@click.option("--top", default=10, show_default=True,
-              help="Number of top errors to display per environment")
+@click.option("--top", default=None, show_default=True,
+              help="Number of top errors to display per environment (default: all)")
 @click.option("--severity", "-s",
               type=click.Choice(["ALL", "ERROR", "WARN", "CRITICAL", "FATAL", "EXCEPTION"],
                                 case_sensitive=False),
@@ -347,7 +347,7 @@ def main(issue, jql, logs, api_base, email, email_keyword,
                 tbl.add_column("Import Log ID", width=36)
                 tbl.add_column("Error", style="red")
                 tbl.add_column("Message")
-                for r in errors[:top]:
+                for r in (errors if top is None else errors[:top]):
                     lvl_style = "red" if r.get("level", "ERROR") in ("ERROR", "CRITICAL", "FATAL") else "yellow"
                     tbl.add_row(
                         r.get("ts", ""),
@@ -358,7 +358,7 @@ def main(issue, jql, logs, api_base, email, email_keyword,
                         r.get("message", r.get("raw", ""))[:120],
                     )
                 console.print(tbl)
-                if total > top:
+                if top is not None and total > top:
                     console.print(f"[dim]… {total - top} more events — use --html to see all[/dim]")
             else:
                 console.print("[dim]No errors or warnings found.[/dim]")
@@ -388,7 +388,7 @@ def main(issue, jql, logs, api_base, email, email_keyword,
             f"\n[bold]Environments:[/bold] {', '.join(e.upper() for e in envs_to_query)}  |  "
             f"[bold]Window:[/bold] last {hours}h  |  "
             f"[bold]Severity:[/bold] {severity}  |  "
-            f"[bold]Top:[/bold] {top} errors\n"
+            f"[bold]Top:[/bold] {top if top is not None else 'all'} errors\n"
         )
 
         env_results = {}
