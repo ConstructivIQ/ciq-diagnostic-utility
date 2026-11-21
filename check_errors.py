@@ -14,6 +14,7 @@ import json
 import re
 import sys
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -332,75 +333,150 @@ def collect_env(env: str, hours: int, severity: str) -> dict:
     id_found         = 0
     total_events     = 0
 
-    for svc, group in services.items():
-        print(f"    {svc}…", end=" ", flush=True)
+    def _fetch_service(svc: str, group: str):
+        """Fetch and process one service log group. Returns per-service result dict."""
+        # Each thread needs its own boto3 client (not thread-safe to share)
+        svc_cw = make_client(env)
         try:
-            events = fetch_events(cw, group, start_ms, end_ms)
-            totals[svc] = len(events)
-            total_events += len(events)
-            print(f"{len(events)} events")
+            events = fetch_events(svc_cw, group, start_ms, end_ms)
+        except Exception as exc:
+            return svc, {"error": str(exc)}
 
-            for ev in events:
-                raw    = (ev.get("message") or "").rstrip()
-                stream = ev.get("logStreamName", "")
-                sev    = extract_severity(raw)
-                sev_totals[sev] += 1
+        r_counts           = Counter()
+        r_latest           = {}
+        r_service_hits     = defaultdict(set)
+        r_raw_samples      = {}
+        r_raw_json_samples = {}
+        r_raw_json_ts      = {}
+        r_severities       = {}
+        r_sev_totals       = Counter()
+        r_sub_hits         = defaultdict(set)
+        r_proj_hits        = defaultdict(set)
+        r_sub_errors       = Counter()
+        r_proj_errors      = Counter()
+        r_sub_latest       = {}
+        r_proj_latest      = {}
+        r_cust_names       = {}
+        r_id_found         = 0
 
-                if severity != "ALL":
-                    if severity == "ERROR" and sev not in ("ERROR","CRITICAL","FATAL","EXCEPTION"):
-                        continue
-                    elif severity not in ("ALL","ERROR") and sev != severity:
-                        continue
+        for ev in events:
+            raw    = (ev.get("message") or "").rstrip()
+            stream = ev.get("logStreamName", "")
+            sev    = extract_severity(raw)
+            r_sev_totals[sev] += 1
 
-                sub_id, proj_id = extract_ids(raw, stream)
-                if sub_id or proj_id:
-                    id_found += 1
+            if severity != "ALL":
+                if severity == "ERROR" and sev not in ("ERROR","CRITICAL","FATAL","EXCEPTION"):
+                    continue
+                elif severity not in ("ALL","ERROR") and sev != severity:
+                    continue
 
-                msg = extract_message(raw)
-                key = normalise(msg)
-                counts[key] += 1
-                service_hits[key].add(svc)
-                if key not in raw_samples:
-                    raw_samples[key] = msg  # store full message; CSS handles display truncation
-                if key not in severities:
-                    severities[key] = sev
+            sub_id, proj_id = extract_ids(raw, stream)
+            if sub_id or proj_id:
+                r_id_found += 1
 
-                ts_ms_ev = ev["timestamp"]
-                ts = datetime.fromtimestamp(
-                    ts_ms_ev / 1000, tz=timezone.utc
-                ).astimezone(_IST).strftime("%d %b %Y %H:%M:%S IST")
+            msg = extract_message(raw)
+            key = normalise(msg)
+            r_counts[key] += 1
+            r_service_hits[key].add(svc)
+            if key not in r_raw_samples:
+                r_raw_samples[key] = msg
+            if key not in r_severities:
+                r_severities[key] = sev
+
+            ts_ms_ev = ev["timestamp"]
+            ts = datetime.fromtimestamp(
+                ts_ms_ev / 1000, tz=timezone.utc
+            ).astimezone(_IST).strftime("%d %b %Y %H:%M:%S IST")
+            if key not in r_latest or ts > r_latest[key]:
+                r_latest[key] = ts
+            if ts_ms_ev > r_raw_json_ts.get(key, 0):
+                r_raw_json_ts[key]      = ts_ms_ev
+                r_raw_json_samples[key] = raw
+
+            if sub_id:
+                r_sub_hits[key].add(sub_id)
+                r_sub_errors[sub_id] += 1
+                ts_ms = ev["timestamp"]
+                if ts_ms > r_sub_latest.get(sub_id, 0):
+                    r_sub_latest[sub_id] = ts_ms
+                if sub_id not in r_cust_names:
+                    try:
+                        obj = json.loads(raw)
+                        cname = _search_fields(obj, CUSTOMER_NAME_FIELDS)
+                        if cname:
+                            r_cust_names[sub_id] = cname
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+            if proj_id:
+                r_proj_hits[key].add(proj_id)
+                r_proj_errors[proj_id] += 1
+                ts_ms = ev["timestamp"]
+                if ts_ms > r_proj_latest.get(proj_id, 0):
+                    r_proj_latest[proj_id] = ts_ms
+
+        return svc, dict(
+            events_count=len(events),
+            counts=r_counts, latest=r_latest, service_hits=r_service_hits,
+            raw_samples=r_raw_samples, raw_json_samples=r_raw_json_samples,
+            raw_json_ts=r_raw_json_ts, severities=r_severities,
+            sev_totals=r_sev_totals, sub_hits=r_sub_hits, proj_hits=r_proj_hits,
+            sub_errors=r_sub_errors, proj_errors=r_proj_errors,
+            sub_latest=r_sub_latest, proj_latest=r_proj_latest,
+            cust_names=r_cust_names, id_found=r_id_found,
+        )
+
+    # Fetch all services in parallel (I/O-bound — threads are ideal)
+    with ThreadPoolExecutor(max_workers=min(len(services), 8)) as pool:
+        futures = {pool.submit(_fetch_service, svc, group): svc
+                   for svc, group in services.items()}
+        for future in as_completed(futures):
+            svc, result = future.result()
+            if "error" in result:
+                totals[svc] = -1
+                print(f"    {svc}… FAILED — {result['error']}")
+                continue
+
+            n = result["events_count"]
+            totals[svc] = n
+            total_events += n
+            print(f"    {svc}… {n} events")
+
+            # Merge per-service result into aggregated state
+            counts.update(result["counts"])
+            sev_totals.update(result["sev_totals"])
+            sub_errors.update(result["sub_errors"])
+            proj_errors.update(result["proj_errors"])
+            id_found += result["id_found"]
+
+            for key, ts in result["latest"].items():
                 if key not in latest or ts > latest[key]:
                     latest[key] = ts
-                # Track the raw CloudWatch string of the *latest* event per pattern
-                if ts_ms_ev > raw_json_ts.get(key, 0):
-                    raw_json_ts[key]      = ts_ms_ev
-                    raw_json_samples[key] = raw
-
-                if sub_id:
-                    sub_hits[key].add(sub_id)
-                    sub_errors[sub_id] += 1
-                    ts_ms = ev["timestamp"]
-                    if ts_ms > sub_latest.get(sub_id, 0):
-                        sub_latest[sub_id] = ts_ms
-                    # Extract customer name once per sub_id (first occurrence wins)
-                    if sub_id not in cust_names:
-                        try:
-                            obj = json.loads(raw)
-                            cname = _search_fields(obj, CUSTOMER_NAME_FIELDS)
-                            if cname:
-                                cust_names[sub_id] = cname
-                        except (json.JSONDecodeError, AttributeError):
-                            pass
-                if proj_id:
-                    proj_hits[key].add(proj_id)
-                    proj_errors[proj_id] += 1
-                    ts_ms = ev["timestamp"]
-                    if ts_ms > proj_latest.get(proj_id, 0):
-                        proj_latest[proj_id] = ts_ms
-
-        except Exception as exc:
-            totals[svc] = -1
-            print(f"FAILED — {exc}")
+            for key, svcs_set in result["service_hits"].items():
+                service_hits[key].update(svcs_set)
+            for key, msg in result["raw_samples"].items():
+                if key not in raw_samples:
+                    raw_samples[key] = msg
+            for key, sev in result["severities"].items():
+                if key not in severities:
+                    severities[key] = sev
+            for key, raw_ts in result["raw_json_ts"].items():
+                if raw_ts > raw_json_ts.get(key, 0):
+                    raw_json_ts[key]      = raw_ts
+                    raw_json_samples[key] = result["raw_json_samples"][key]
+            for key, subs in result["sub_hits"].items():
+                sub_hits[key].update(subs)
+            for key, projs in result["proj_hits"].items():
+                proj_hits[key].update(projs)
+            for sub_id, ts_ms in result["sub_latest"].items():
+                if ts_ms > sub_latest.get(sub_id, 0):
+                    sub_latest[sub_id] = ts_ms
+            for proj_id, ts_ms in result["proj_latest"].items():
+                if ts_ms > proj_latest.get(proj_id, 0):
+                    proj_latest[proj_id] = ts_ms
+            for sub_id, cname in result["cust_names"].items():
+                if sub_id not in cust_names:
+                    cust_names[sub_id] = cname
 
     return dict(
         counts=counts, latest=latest, service_hits=service_hits,
@@ -438,7 +514,8 @@ def print_env_table(env: str, d: dict, top: int, hours: int):
 
     W = 130
     print(f"\n{'─'*W}")
-    print(f"  {("TOP " + str(top)) if top is not None else "ALL ERRORS"} — {env.upper()} — last {hours}h  ({now.strftime('%Y-%m-%d %H:%M UTC')})")
+    top_label = ("TOP " + str(top)) if top is not None else "ALL ERRORS"
+    print(f"  {top_label} — {env.upper()} — last {hours}h  ({now.strftime('%Y-%m-%d %H:%M UTC')})")
     print(f"{'─'*W}")
     print(f"  {'#':<4} {'SEV':<11} {'Count':>6}  {'Last seen':>12}  {'Service(s)':<28}  Message")
     print(f"  {'─'*4} {'─'*9} {'─'*6}  {'─'*12}  {'─'*28}  {'─'*50}")
